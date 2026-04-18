@@ -1,0 +1,637 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+shopt -s nullglob globstar
+
+# sign-secureboot-nobara
+#
+# Modes:
+#   --enroll         One-time key creation/enrollment, then sign all
+#   --sign-all       Sign all installed kernels, modules, and Linux EFI artifacts
+#   --sign-current   Sign only the booted kernel + its modules (+ Linux EFI unless disabled)
+#   --validate-only  Do not sign; report unsigned Linux artifacts and exit nonzero if any are found
+#
+# Typical usage:
+#   sudo sign-secureboot-nobara --sign-all
+#   sudo sign-secureboot-nobara --sign-current
+#   sudo sign-secureboot-nobara --validate-only
+
+SBCTL_KEY="/var/lib/sbctl/keys/db/db.key"
+SBCTL_CERT="/var/lib/sbctl/keys/db/db.pem"
+
+MODE=""
+INSTALL_SBCTL=1
+SIGN_EFI=1
+SIGN_KERNELS=1
+SIGN_MODULES=1
+VERBOSE=0
+INCLUDE_MICROSOFT_KEYS=0
+
+usage() {
+    cat <<'EOF2'
+Usage:
+  sudo sign-secureboot-nobara [mode] [options]
+
+Modes (choose one):
+  --enroll            Create/enroll keys if needed, then sign all
+  --sign-all          Sign Linux EFI, all installed kernels, and all installed modules
+  --sign-current      Sign Linux EFI, current booted kernel, and its modules
+  --validate-only     Validate signatures only; do not modify anything
+
+Options:
+  --microsoft         With --enroll, include Microsoft keys
+  --no-install        Do not auto-install sbctl
+  --no-efi            Skip EFI binaries
+  --no-kernels        Skip kernel images in /boot
+  --no-modules        Skip kernel modules in /lib/modules
+  --verbose           More logging
+  -h, --help          Show this help
+
+Examples:
+  sudo sign-secureboot-nobara --sign-all
+  sudo sign-secureboot-nobara --sign-current --no-efi
+  sudo sign-secureboot-nobara --validate-only
+  sudo sign-secureboot-nobara --enroll --microsoft
+EOF2
+}
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+vlog() { [[ "$VERBOSE" -eq 1 ]] && printf '%s\n' "$*"; }
+
+require_root() {
+    [[ "$EUID" -eq 0 ]] || die "Run as root."
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --enroll|--sign-all|--sign-current|--validate-only)
+                [[ -z "$MODE" ]] || die "Only one mode may be specified."
+                MODE="${1#--}"
+                ;;
+            --microsoft)
+                INCLUDE_MICROSOFT_KEYS=1
+                ;;
+            --no-install)
+                INSTALL_SBCTL=0
+                ;;
+            --no-efi)
+                SIGN_EFI=0
+                ;;
+            --no-kernels)
+                SIGN_KERNELS=0
+                ;;
+            --no-modules)
+                SIGN_MODULES=0
+                ;;
+            --verbose)
+                VERBOSE=1
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown argument: $1"
+                ;;
+        esac
+        shift
+    done
+
+    [[ -n "$MODE" ]] || MODE="sign-all"
+
+    if [[ "$MODE" == "validate-only" && "$SIGN_EFI" -eq 0 && "$SIGN_KERNELS" -eq 0 && "$SIGN_MODULES" -eq 0 ]]; then
+        die "Nothing selected to validate."
+    fi
+}
+
+ensure_tool() {
+    local tool="$1"
+    command -v "$tool" >/dev/null 2>&1 || die "Required tool not found: $tool"
+}
+
+ensure_deps() {
+    ensure_tool find
+    ensure_tool awk
+    ensure_tool grep
+    ensure_tool modinfo
+    ensure_tool depmod
+    ensure_tool mktemp
+}
+
+ensure_sbctl() {
+    if command -v sbctl >/dev/null 2>&1; then
+        return
+    fi
+
+    [[ "$INSTALL_SBCTL" -eq 1 ]] || die "sbctl is not installed and --no-install was specified."
+
+    log "Installing sbctl..."
+    dnf -y copr enable chenxiaolong/sbctl
+    dnf -y install sbctl
+}
+
+key_material_exists() {
+    [[ -f "$SBCTL_KEY" && -f "$SBCTL_CERT" ]]
+}
+
+require_signing_material() {
+    key_material_exists || die "Missing signing material:
+  $SBCTL_KEY
+  $SBCTL_CERT
+
+If your key has not been created/enrolled yet, run:
+  sudo sign-secureboot-nobara --enroll
+
+If it has, verify your sbctl key paths."
+}
+
+sbctl_status_text() {
+    sbctl status 2>/dev/null || true
+}
+
+secure_boot_enabled() {
+    grep -Eq '^Secure Boot:[[:space:]]+✓' <<<"$(sbctl_status_text)"
+}
+
+setup_mode_enabled() {
+    grep -Eq '^Setup Mode:[[:space:]]+✓' <<<"$(sbctl_status_text)"
+}
+
+print_status() {
+    log "=== sbctl status ==="
+    sbctl status || true
+    log
+}
+
+enroll_keys() {
+    if ! key_material_exists; then
+        log "Creating sbctl keys..."
+        sbctl create-keys
+    else
+        log "Key material already exists, skipping create-keys."
+    fi
+
+    if [[ "$INCLUDE_MICROSOFT_KEYS" -eq 1 ]]; then
+        log "Enrolling keys with Microsoft vendor keys..."
+        sbctl enroll-keys --microsoft
+    else
+        log "Enrolling keys..."
+        sbctl enroll-keys
+    fi
+}
+
+# Linux-managed EFI policy:
+# - Always include Fedora-managed EFI files
+# - Optionally include generic fallback path files that are Linux bootloaders
+# - Never touch Microsoft files under EFI/Microsoft
+# - Kernel images in /boot are handled separately and are always Linux-managed
+is_linux_managed_efi_path() {
+    local file="$1"
+
+    case "$file" in
+        /boot/efi/EFI/fedora/*) return 0 ;;
+        /boot/efi/EFI/BOOT/bootx64.efi) return 0 ;;
+        /boot/efi/EFI/BOOT/BOOTX64.EFI) return 0 ;;
+        /boot/efi/EFI/BOOT/mmx64.efi) return 0 ;;
+        /boot/efi/EFI/BOOT/grubx64.efi) return 0 ;;
+        /boot/efi/EFI/Boot/bootx64.efi) return 0 ;;
+        /boot/efi/EFI/Boot/BOOTX64.EFI) return 0 ;;
+        /boot/efi/EFI/Boot/mmx64.efi) return 0 ;;
+        /boot/efi/EFI/Boot/grubx64.efi) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+is_signable_efi_binary() {
+    local file="$1"
+    [[ "$file" =~ \.(efi|EFI)$ ]]
+}
+
+sign_with_sbctl() {
+    local file="$1"
+    log "Signing with sbctl: $file"
+    sbctl sign -s "$file"
+}
+
+decompress_module() {
+    local src="$1"
+    local dst="$2"
+
+    case "$src" in
+        *.ko)
+            cp -f -- "$src" "$dst"
+            ;;
+        *.ko.xz)
+            ensure_tool xz
+            xz -dc -- "$src" > "$dst"
+            ;;
+        *.ko.zst)
+            ensure_tool zstd
+            zstd -dc -- "$src" > "$dst"
+            ;;
+        *)
+            die "Unsupported module format: $src"
+            ;;
+    esac
+}
+
+recompress_module() {
+    local src_ko="$1"
+    local dst="$2"
+
+    case "$dst" in
+        *.ko)
+            cp -f -- "$src_ko" "$dst"
+            ;;
+        *.ko.xz)
+            ensure_tool xz
+            xz -f -C crc32 -z -T0 --stdout "$src_ko" > "$dst"
+            ;;
+        *.ko.zst)
+            ensure_tool zstd
+            zstd -q -f -T0 -19 --stdout "$src_ko" > "$dst"
+            ;;
+        *)
+            die "Unsupported module format: $dst"
+            ;;
+    esac
+}
+
+module_signer() {
+    local file="$1"
+
+    case "$file" in
+        *.ko)
+            modinfo -F signer "$file" 2>/dev/null || true
+            ;;
+        *.ko.xz|*.ko.zst)
+            local tmp
+            tmp="$(mktemp --suffix=.ko)"
+            decompress_module "$file" "$tmp"
+            modinfo -F signer "$tmp" 2>/dev/null || true
+            rm -f "$tmp"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+module_already_signed() {
+    local signer
+    signer="$(module_signer "$1")"
+    [[ -n "$signer" ]]
+}
+
+find_sign_file() {
+    local kver="$1"
+    local candidates=(
+        "/lib/modules/$kver/build/scripts/sign-file"
+        "/usr/src/kernels/$kver/scripts/sign-file"
+    )
+    local c
+
+    for c in "${candidates[@]}"; do
+        [[ -x "$c" ]] && { printf '%s\n' "$c"; return 0; }
+    done
+
+    return 1
+}
+
+sign_one_module() {
+    local module="$1"
+    local sign_file="$2"
+
+    if module_already_signed "$module"; then
+        vlog "Already signed module: $module"
+        return 0
+    fi
+
+    local tmpdir tmpko
+    tmpdir="$(mktemp -d)"
+    tmpko="$tmpdir/module.ko"
+
+    decompress_module "$module" "$tmpko"
+    "$sign_file" sha256 "$SBCTL_KEY" "$SBCTL_CERT" "$tmpko"
+    recompress_module "$tmpko" "$module"
+
+    rm -rf "$tmpdir"
+    log "Signed module: $module"
+}
+
+sign_modules_for_kernel() {
+    local kver="$1"
+    local root="/lib/modules/$kver"
+    [[ -d "$root" ]] || return 0
+
+    local sign_file
+    sign_file="$(find_sign_file "$kver")" || {
+        warn "No sign-file helper found for kernel $kver, skipping modules."
+        return 0
+    }
+
+    local mod failed=0
+    while IFS= read -r -d '' mod; do
+        if ! sign_one_module "$mod" "$sign_file"; then
+            warn "Failed to sign module: $mod"
+            failed=1
+        fi
+    done < <(find "$root" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \) -print0)
+
+    depmod -a "$kver" || warn "depmod failed for $kver"
+    return "$failed"
+}
+
+validate_modules_for_kernel() {
+    local kver="$1"
+    local root="/lib/modules/$kver"
+    [[ -d "$root" ]] || return 0
+
+    local mod signer failed=0
+    while IFS= read -r -d '' mod; do
+        signer="$(module_signer "$mod")"
+        if [[ -z "$signer" ]]; then
+            log "UNSIGNED MODULE: $mod"
+            failed=1
+        else
+            vlog "signed module: $mod (signer: $signer)"
+        fi
+    done < <(find "$root" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \) -print0)
+
+    return "$failed"
+}
+
+sign_unsigned_efi_from_verify() {
+    local out found=0 failed=0 file
+
+    out="$(sbctl verify 2>&1 || true)"
+    while IFS= read -r line; do
+        [[ "$line" == *"failed to verify file"* ]] && continue
+
+        if [[ "$line" =~ ✗[[:space:]]+(/[^[:space:]]+)[[:space:]]+is[[:space:]]+not[[:space:]]+signed$ ]]; then
+            file="${BASH_REMATCH[1]}"
+
+            is_signable_efi_binary "$file" || continue
+            is_linux_managed_efi_path "$file" || continue
+
+            found=1
+            if ! sign_with_sbctl "$file"; then
+                warn "Failed to sign EFI binary: $file"
+                failed=1
+            fi
+        fi
+    done <<< "$out"
+
+    [[ "$found" -eq 1 ]] || log "No unsigned Linux EFI binaries reported by sbctl verify."
+    return "$failed"
+}
+
+validate_efi_and_kernels() {
+    local out failed=0 file
+
+    out="$(sbctl verify 2>&1 || true)"
+
+    while IFS= read -r line; do
+        [[ "$line" == *"failed to verify file"* ]] && continue
+
+        if [[ "$line" =~ ^✓[[:space:]]+(/[^[:space:]]+) ]]; then
+            file="${BASH_REMATCH[1]}"
+            if [[ "$file" == /boot/vmlinuz-* ]] || is_linux_managed_efi_path "$file"; then
+                printf '%s\n' "$line"
+            fi
+            continue
+        fi
+
+        if [[ "$line" =~ ^✗[[:space:]]+(/[^[:space:]]+)[[:space:]]+is[[:space:]]+not[[:space:]]+signed$ ]]; then
+            file="${BASH_REMATCH[1]}"
+
+            if [[ "$file" == /boot/vmlinuz-* ]]; then
+                printf '%s\n' "$line"
+                failed=1
+                continue
+            fi
+
+            if is_signable_efi_binary "$file" && is_linux_managed_efi_path "$file"; then
+                printf '%s\n' "$line"
+                failed=1
+            fi
+        fi
+    done <<< "$out"
+
+    return "$failed"
+}
+
+sign_all_kernel_images() {
+    local kernels=(/boot/vmlinuz-*)
+    [[ "${#kernels[@]}" -gt 0 ]] || {
+        log "No kernel images found in /boot."
+        return 0
+    }
+
+    local k failed=0
+    for k in "${kernels[@]}"; do
+        [[ -f "$k" ]] || continue
+        if ! sign_with_sbctl "$k"; then
+            warn "Failed to sign kernel image: $k"
+            failed=1
+        fi
+    done
+
+    return "$failed"
+}
+
+sign_current_kernel_image() {
+    local kver kernel
+    kver="$(uname -r)"
+    kernel="/boot/vmlinuz-$kver"
+
+    [[ -f "$kernel" ]] || {
+        warn "Current kernel image not found: $kernel"
+        return 0
+    }
+
+    sign_with_sbctl "$kernel"
+}
+
+sign_all_modules() {
+    local d kver failed=0
+    for d in /lib/modules/*; do
+        [[ -d "$d" ]] || continue
+        kver="${d##*/}"
+        log "Processing modules for kernel: $kver"
+        if ! sign_modules_for_kernel "$kver"; then
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+validate_all_modules() {
+    local d kver failed=0
+    for d in /lib/modules/*; do
+        [[ -d "$d" ]] || continue
+        kver="${d##*/}"
+        log "Validating modules for kernel: $kver"
+        if ! validate_modules_for_kernel "$kver"; then
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+sign_current_modules() {
+    local kver
+    kver="$(uname -r)"
+    sign_modules_for_kernel "$kver"
+}
+
+validate_current_modules() {
+    local kver
+    kver="$(uname -r)"
+    validate_modules_for_kernel "$kver"
+}
+
+run_validate_only() {
+    local failed=0
+
+    require_signing_material
+
+    if [[ "$SIGN_EFI" -eq 1 || "$SIGN_KERNELS" -eq 1 ]]; then
+        log "=== Validating Linux EFI binaries and kernel images ==="
+        validate_efi_and_kernels || failed=1
+        log
+    fi
+
+    if [[ "$SIGN_MODULES" -eq 1 ]]; then
+        log "=== Validating kernel modules ==="
+        validate_all_modules || failed=1
+        log
+    fi
+
+    if [[ "$failed" -eq 1 ]]; then
+        die "Validation failed: unsigned Linux artifacts were found."
+    fi
+
+    log "Validation passed."
+}
+
+run_sign_all() {
+    local failed=0
+
+    require_signing_material
+
+    if [[ "$SIGN_EFI" -eq 1 ]]; then
+        log "=== Signing Linux EFI binaries ==="
+        sign_unsigned_efi_from_verify || failed=1
+        log
+    fi
+
+    if [[ "$SIGN_KERNELS" -eq 1 ]]; then
+        log "=== Signing all kernel images ==="
+        sign_all_kernel_images || failed=1
+        log
+    fi
+
+    if [[ "$SIGN_MODULES" -eq 1 ]]; then
+        log "=== Signing all kernel modules ==="
+        sign_all_modules || failed=1
+        log
+    fi
+
+    log "=== Final validation ==="
+    validate_efi_and_kernels || failed=1
+    if [[ "$SIGN_MODULES" -eq 1 ]]; then
+        validate_all_modules || failed=1
+    fi
+
+    [[ "$failed" -eq 0 ]] || die "Signing completed with errors."
+    log "Signing completed successfully."
+}
+
+run_sign_current() {
+    local failed=0
+    local kver
+    kver="$(uname -r)"
+
+    require_signing_material
+    log "Operating on current booted kernel: $kver"
+    log
+
+    if [[ "$SIGN_EFI" -eq 1 ]]; then
+        log "=== Signing Linux EFI binaries ==="
+        sign_unsigned_efi_from_verify || failed=1
+        log
+    fi
+
+    if [[ "$SIGN_KERNELS" -eq 1 ]]; then
+        log "=== Signing current kernel image ==="
+        sign_current_kernel_image || failed=1
+        log
+    fi
+
+    if [[ "$SIGN_MODULES" -eq 1 ]]; then
+        log "=== Signing current kernel modules ==="
+        sign_current_modules || failed=1
+        log
+    fi
+
+    log "=== Final validation ==="
+    validate_efi_and_kernels || failed=1
+    if [[ "$SIGN_MODULES" -eq 1 ]]; then
+        validate_current_modules || failed=1
+    fi
+
+    [[ "$failed" -eq 0 ]] || die "Signing current kernel completed with errors."
+    log "Current kernel signing completed successfully."
+}
+
+run_enroll() {
+    print_status
+
+    if secure_boot_enabled; then
+        log "Secure Boot is enabled."
+    else
+        log "Secure Boot appears disabled right now. That is okay during setup/signing."
+    fi
+
+    if setup_mode_enabled; then
+        log "Firmware is in Setup Mode."
+    else
+        log "Firmware is not in Setup Mode."
+    fi
+    log
+
+    enroll_keys
+    log
+    print_status
+    run_sign_all
+}
+
+main() {
+    require_root
+    parse_args "$@"
+    ensure_deps
+    ensure_sbctl
+
+    case "$MODE" in
+        enroll)
+            run_enroll
+            ;;
+        sign-all)
+            run_sign_all
+            ;;
+        sign-current)
+            run_sign_current
+            ;;
+        validate-only)
+            run_validate_only
+            ;;
+        *)
+            die "Unhandled mode: $MODE"
+            ;;
+    esac
+}
+
+main "$@"
